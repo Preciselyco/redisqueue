@@ -1,6 +1,6 @@
 module github.com/Preciselyco/redisqueue/v2
 
-go 1.18
+go 1.19
 
 require (
 	github.com/git-chglog/git-chglog v0.15.1
