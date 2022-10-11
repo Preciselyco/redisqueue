@@ -2,6 +2,7 @@ package redisqueue
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -63,6 +64,9 @@ type ConsumerOptions struct {
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
+	//
+	// PruneTimeout dictates how long a consumer needs to be idle before we try to remove it
+	PruneTimeout time.Duration
 }
 
 // Consumer adds a convenient wrapper around dequeuing and managing concurrency.
@@ -93,6 +97,7 @@ var defaultConsumerOptions = &ConsumerOptions{
 	ReclaimInterval:   1 * time.Second,
 	BufferSize:        100,
 	Concurrency:       10,
+	PruneTimeout:      24 * time.Second,
 }
 
 // NewConsumer uses a default set of options to create a Consumer. It sets Name
@@ -183,7 +188,7 @@ func (c *Consumer) Register(stream string, fn ConsumerFunc) {
 // Run will terminate early. The same will happen if an error occurs when
 // creating the consumer group in Redis. Run will block until Shutdown is called
 // and all of the in-flight messages have been processed.
-func (c *Consumer) Run() {
+func (c *Consumer) Run(ctx context.Context) {
 	if len(c.consumers) == 0 {
 		c.Errors <- errors.New("at least one consumer function needs to be registered")
 		return
@@ -191,7 +196,7 @@ func (c *Consumer) Run() {
 
 	for stream, consumer := range c.consumers {
 		c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(context.Background(), stream, c.options.GroupName, consumer.id).Err()
+		err := c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
 		// ignoring the BUSYGROUP error makes this a noop
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			c.Errors <- errors.Wrap(err, "error creating consumer group")
@@ -218,7 +223,55 @@ func (c *Consumer) Run() {
 		go c.work()
 	}
 
+	// find first 1000 event streams in redis
+	sCmd := c.redis.ScanType(ctx, 0, "*.events.*", 1000, "STREAM")
+	streams, _, err := sCmd.Result()
+	if err != nil {
+		c.Errors <- errors.New("failed to list streams from redis")
+	}
+
+	// prune old inactive consumers
+	for _, stream := range streams {
+		cu := c.redis.XInfoConsumers(ctx, stream, c.options.GroupName)
+		cs, err := cu.Result()
+		if err != nil {
+			c.Errors <- errors.New(fmt.Sprintf("failed to list consumers for stream: %q group: %q", stream, c.options.GroupName))
+			continue
+		}
+		for _, consumer := range cs {
+			if consumer.Name != c.options.Name && // don't remove self
+				consumer.Pending == 0 && // don't remove with pending msg
+				consumer.Idle > c.options.PruneTimeout.Milliseconds() { // respect PruneTimeout before trying to delete
+				rCmd := c.redis.XGroupDelConsumer(ctx, stream, c.options.GroupName, consumer.Name)
+				pendingMsgCount, err := rCmd.Result()
+				if err != nil {
+					c.Errors <- errors.New(fmt.Sprintf("failed to remove consumer: %q for stream: %q group: %q", consumer.Name, stream, c.options.GroupName))
+				}
+				if pendingMsgCount > 0 {
+					c.Errors <- errors.New(fmt.Sprintf("remove consumer: %q with pending messages: %d for stream: %q group: %q", consumer.Name, pendingMsgCount, stream, c.options.GroupName))
+				}
+
+				// prevent ddos on redis
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}
+
+	// blocking, waiting for shutdown
 	c.wg.Wait()
+}
+
+func (c *Consumer) removeConsumerFromStream(stream string) {
+	fmt.Println("removeConsumerFromStream:" + stream)
+	name := c.options.Name
+	rCmd := c.redis.XGroupDelConsumer(context.Background(), stream, c.options.GroupName, c.options.Name)
+	pendingMsgCount, err := rCmd.Result()
+	if err != nil {
+		c.Errors <- errors.New(fmt.Sprintf("failed to remove consumer: %q for stream: %q group: %q", name, stream, c.options.GroupName))
+	}
+	if pendingMsgCount > 0 {
+		c.Errors <- errors.New(fmt.Sprintf("remove consumer: %q with pending messages: %d for stream: %q group: %q", name, pendingMsgCount, stream, c.options.GroupName))
+	}
 }
 
 // Shutdown stops new messages from being processed and tells the workers to
@@ -229,6 +282,11 @@ func (c *Consumer) Shutdown() {
 	c.stopReclaim <- struct{}{}
 	if c.options.VisibilityTimeout == 0 {
 		c.stopPoll <- struct{}{}
+	}
+
+	// remove current consumer from streams
+	for stream := range c.consumers {
+		c.removeConsumerFromStream(stream)
 	}
 }
 
