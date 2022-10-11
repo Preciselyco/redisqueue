@@ -97,7 +97,7 @@ var defaultConsumerOptions = &ConsumerOptions{
 	ReclaimInterval:   1 * time.Second,
 	BufferSize:        100,
 	Concurrency:       10,
-	PruneTimeout:      24 * time.Second,
+	PruneTimeout:      24 * time.Hour,
 }
 
 // NewConsumer uses a default set of options to create a Consumer. It sets Name
@@ -235,7 +235,7 @@ func (c *Consumer) Run(ctx context.Context) {
 		cu := c.redis.XInfoConsumers(ctx, stream, c.options.GroupName)
 		cs, err := cu.Result()
 		if err != nil {
-			c.Errors <- errors.New(fmt.Sprintf("failed to list consumers for stream: %q group: %q", stream, c.options.GroupName))
+			c.Errors <- fmt.Errorf("failed to list consumers for stream: %q group: %q", stream, c.options.GroupName)
 			continue
 		}
 		for _, consumer := range cs {
@@ -245,14 +245,14 @@ func (c *Consumer) Run(ctx context.Context) {
 				rCmd := c.redis.XGroupDelConsumer(ctx, stream, c.options.GroupName, consumer.Name)
 				pendingMsgCount, err := rCmd.Result()
 				if err != nil {
-					c.Errors <- errors.New(fmt.Sprintf("failed to remove consumer: %q for stream: %q group: %q", consumer.Name, stream, c.options.GroupName))
+					c.Errors <- fmt.Errorf("failed to remove consumer: %q for stream: %q group: %q", consumer.Name, stream, c.options.GroupName)
 				}
 				if pendingMsgCount > 0 {
-					c.Errors <- errors.New(fmt.Sprintf("remove consumer: %q with pending messages: %d for stream: %q group: %q", consumer.Name, pendingMsgCount, stream, c.options.GroupName))
+					c.Errors <- fmt.Errorf("remove consumer: %q with pending messages: %d for stream: %q group: %q", consumer.Name, pendingMsgCount, stream, c.options.GroupName)
 				}
 
 				// prevent ddos on redis
-				time.Sleep(1 * time.Second)
+				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}
@@ -262,15 +262,14 @@ func (c *Consumer) Run(ctx context.Context) {
 }
 
 func (c *Consumer) removeConsumerFromStream(stream string) {
-	fmt.Println("removeConsumerFromStream:" + stream)
 	name := c.options.Name
 	rCmd := c.redis.XGroupDelConsumer(context.Background(), stream, c.options.GroupName, c.options.Name)
 	pendingMsgCount, err := rCmd.Result()
 	if err != nil {
-		c.Errors <- errors.New(fmt.Sprintf("failed to remove consumer: %q for stream: %q group: %q", name, stream, c.options.GroupName))
+		c.Errors <- fmt.Errorf("failed to remove consumer: %q for stream: %q group: %q", name, stream, c.options.GroupName)
 	}
 	if pendingMsgCount > 0 {
-		c.Errors <- errors.New(fmt.Sprintf("remove consumer: %q with pending messages: %d for stream: %q group: %q", name, pendingMsgCount, stream, c.options.GroupName))
+		c.Errors <- fmt.Errorf("removed consumer: %q with pending messages: %d for stream: %q group: %q", name, pendingMsgCount, stream, c.options.GroupName)
 	}
 }
 
