@@ -3,7 +3,7 @@ package redisqueue
 import (
 	"context"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 // ProducerOptions provide options to configure the Producer.
@@ -31,6 +31,10 @@ type ProducerOptions struct {
 	//
 	// This field is used if RedisClient field is nil.
 	RedisOptions *RedisOptions
+	//
+	// UsePreflightCheck decides if the check for version 5 of the server should be run.
+	// Default true
+	UsePreflightCheck bool
 }
 
 // Producer adds a convenient wrapper around enqueuing messages that will be
@@ -43,6 +47,7 @@ type Producer struct {
 var defaultProducerOptions = &ProducerOptions{
 	StreamMaxLength:      1000,
 	ApproximateMaxLength: true,
+	UsePreflightCheck:    true,
 }
 
 // NewProducer uses a default set of options to create a Producer. It sets
@@ -62,8 +67,10 @@ func NewProducerWithOptions(ctx context.Context, options *ProducerOptions) (*Pro
 		r = newRedisClient(options.RedisOptions)
 	}
 
-	if err := redisPreflightChecks(ctx, r); err != nil {
-		return nil, err
+	if options.UsePreflightCheck {
+		if err := redisPreflightChecks(ctx, r); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Producer{
@@ -81,11 +88,8 @@ func (p *Producer) Enqueue(ctx context.Context, msg *Message) error {
 		ID:     msg.ID,
 		Stream: msg.Stream,
 		Values: msg.Values,
-	}
-	if p.options.ApproximateMaxLength {
-		args.MaxLenApprox = p.options.StreamMaxLength
-	} else {
-		args.MaxLen = p.options.StreamMaxLength
+		MaxLen: p.options.StreamMaxLength,
+		Approx: p.options.ApproximateMaxLength,
 	}
 	id, err := p.redis.XAdd(ctx, args).Result()
 	if err != nil {

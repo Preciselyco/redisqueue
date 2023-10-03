@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 )
 
 // ConsumerFunc is a type alias for the functions that will be used to handle
@@ -67,6 +67,10 @@ type ConsumerOptions struct {
 	//
 	// PruneTimeout dictates how long a consumer needs to be idle before we try to remove it
 	PruneTimeout time.Duration
+	//
+	// UsePreflightCheck decides if the check for version 5 of the server should be run.
+	// Default true
+	UsePreflightCheck bool
 }
 
 // Consumer adds a convenient wrapper around dequeuing and managing concurrency.
@@ -98,6 +102,7 @@ var defaultConsumerOptions = &ConsumerOptions{
 	BufferSize:        100,
 	Concurrency:       10,
 	PruneTimeout:      24 * time.Hour,
+	UsePreflightCheck: true,
 }
 
 // NewConsumer uses a default set of options to create a Consumer. It sets Name
@@ -136,8 +141,10 @@ func NewConsumerWithOptions(ctx context.Context, options *ConsumerOptions) (*Con
 		r = newRedisClient(options.RedisOptions)
 	}
 
-	if err := redisPreflightChecks(ctx, r); err != nil {
-		return nil, err
+	if options.UsePreflightCheck {
+		if err := redisPreflightChecks(ctx, r); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Consumer{
@@ -241,7 +248,7 @@ func (c *Consumer) Run(ctx context.Context) {
 		for _, consumer := range cs {
 			if consumer.Name != c.options.Name && // don't remove self
 				consumer.Pending == 0 && // don't remove with pending msg
-				consumer.Idle > c.options.PruneTimeout.Milliseconds() { // respect PruneTimeout before trying to delete
+				consumer.Idle > c.options.PruneTimeout { // respect PruneTimeout before trying to delete
 				rCmd := c.redis.XGroupDelConsumer(ctx, stream, c.options.GroupName, consumer.Name)
 				pendingMsgCount, err := rCmd.Result()
 				if err != nil {
