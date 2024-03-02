@@ -7,8 +7,9 @@ require (
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/mattn/goveralls v0.0.11
 	github.com/pkg/errors v0.9.1
+	github.com/redis/go-redis/v9 v9.2.1
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.8.0
+	github.com/stretchr/testify v1.9.0
 )
 
 require (
@@ -40,7 +41,6 @@ require (
 	github.com/mitchellh/copystructure v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/redis/go-redis/v9 v9.2.1 // indirect
 	github.com/rogpeppe/go-internal v1.6.2 // indirect
 	github.com/russross/blackfriday/v2 v2.0.1 // indirect
 	github.com/shopspring/decimal v1.2.0 // indirect
