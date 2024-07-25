@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/git-chglog/git-chglog v0.15.1
-	github.com/go-redis/redis/v8 v8.11.5
+	github.com/go-redis/redis/v9 v9.6.1
 	github.com/mattn/goveralls v0.0.11
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
