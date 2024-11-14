@@ -43,7 +43,7 @@ func main() {
 		for x, consumer := range cs {
 			var action string
 			if consumer.Pending == 0 && // don't remove with pending msg
-				consumer.Idle > time.Hour.Milliseconds()*24 { // respect consumers having been idle for more than 24 h (PruneTimeout) before trying to delete
+				consumer.Idle > time.Duration(time.Hour*24) { // respect consumers having been idle for more than 24 h (PruneTimeout) before trying to delete
 				action = "removing"
 				rCmd := redisClient.XGroupDelConsumer(context.Background(), stream, group, consumer.Name)
 				pendingMsgCount, err := rCmd.Result()
