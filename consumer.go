@@ -198,6 +198,18 @@ func (c *Consumer) Register(stream string, fn ConsumerFunc) {
 	c.RegisterWithLastID(stream, "0", fn)
 }
 
+func (c *Consumer) createGroupsAndStreams(ctx context.Context) error {
+	for stream, consumer := range c.consumers {
+		c.streams = append(c.streams, stream)
+		err := c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
+		// ignoring the BUSYGROUP error makes this a noop
+		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+			return errors.Wrap(err, "error creating consumer group")
+		}
+	}
+	return nil
+}
+
 // Run starts all of the worker goroutines and starts processing from the
 // streams that have been registered with Register. All errors will be sent to
 // the Errors channel. If Register was never called, an error will be sent and
@@ -210,14 +222,10 @@ func (c *Consumer) Run(ctx context.Context) {
 		return
 	}
 
-	for stream, consumer := range c.consumers {
-		c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
-		// ignoring the BUSYGROUP error makes this a noop
-		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			c.Errors <- errors.Wrap(err, "error creating consumer group")
-			return
-		}
+	err := c.createGroupsAndStreams(ctx)
+	if err != nil {
+		c.Errors <- errors.Wrap(err, "error creating consumer group")
+		return
 	}
 
 	for i := 0; i < len(c.consumers); i++ {
