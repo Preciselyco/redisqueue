@@ -5,11 +5,16 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Preciselyco/gopkg/logger"
+	"github.com/Preciselyco/gopkg/stackerr"
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 )
 
 // ConsumerFunc is a type alias for the functions that will be used to handle
@@ -71,6 +76,10 @@ type ConsumerOptions struct {
 	// UsePreflightCheck decides if the check for version 5 of the server should be run.
 	// Default true
 	UsePreflightCheck bool
+	//
+	// Automatically try to unregister consumer from streams when shutting down
+	// Default false
+	UnregisterOnShutdown bool
 }
 
 // Consumer adds a convenient wrapper around dequeuing and managing concurrency.
@@ -189,6 +198,18 @@ func (c *Consumer) Register(stream string, fn ConsumerFunc) {
 	c.RegisterWithLastID(stream, "0", fn)
 }
 
+func (c *Consumer) createGroupsAndStreams(ctx context.Context) error {
+	for stream, consumer := range c.consumers {
+		c.streams = append(c.streams, stream)
+		err := c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
+		// ignoring the BUSYGROUP error makes this a noop
+		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+			return errors.Wrap(err, "error creating consumer group")
+		}
+	}
+	return nil
+}
+
 // Run starts all of the worker goroutines and starts processing from the
 // streams that have been registered with Register. All errors will be sent to
 // the Errors channel. If Register was never called, an error will be sent and
@@ -201,14 +222,10 @@ func (c *Consumer) Run(ctx context.Context) {
 		return
 	}
 
-	for stream, consumer := range c.consumers {
-		c.streams = append(c.streams, stream)
-		err := c.redis.XGroupCreateMkStream(ctx, stream, c.options.GroupName, consumer.id).Err()
-		// ignoring the BUSYGROUP error makes this a noop
-		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			c.Errors <- errors.Wrap(err, "error creating consumer group")
-			return
-		}
+	err := c.createGroupsAndStreams(ctx)
+	if err != nil {
+		c.Errors <- errors.Wrap(err, "error creating consumer group")
+		return
 	}
 
 	for i := 0; i < len(c.consumers); i++ {
@@ -230,40 +247,6 @@ func (c *Consumer) Run(ctx context.Context) {
 		go c.work()
 	}
 
-	// find first 1000 event streams in redis
-	sCmd := c.redis.ScanType(ctx, 0, "*.events.*", 1000, "STREAM")
-	streams, _, err := sCmd.Result()
-	if err != nil {
-		c.Errors <- errors.New("failed to list streams from redis")
-	}
-
-	// prune old inactive consumers
-	for _, stream := range streams {
-		cu := c.redis.XInfoConsumers(ctx, stream, c.options.GroupName)
-		cs, err := cu.Result()
-		if err != nil {
-			c.Errors <- fmt.Errorf("failed to list consumers for stream: %q group: %q", stream, c.options.GroupName)
-			continue
-		}
-		for _, consumer := range cs {
-			if consumer.Name != c.options.Name && // don't remove self
-				consumer.Pending == 0 && // don't remove with pending msg
-				consumer.Idle > c.options.PruneTimeout { // respect PruneTimeout before trying to delete
-				rCmd := c.redis.XGroupDelConsumer(ctx, stream, c.options.GroupName, consumer.Name)
-				pendingMsgCount, err := rCmd.Result()
-				if err != nil {
-					c.Errors <- fmt.Errorf("failed to remove consumer: %q for stream: %q group: %q", consumer.Name, stream, c.options.GroupName)
-				}
-				if pendingMsgCount > 0 {
-					c.Errors <- fmt.Errorf("remove consumer: %q with pending messages: %d for stream: %q group: %q", consumer.Name, pendingMsgCount, stream, c.options.GroupName)
-				}
-
-				// prevent ddos on redis
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-	}
-
 	// blocking, waiting for shutdown
 	c.wg.Wait()
 }
@@ -280,6 +263,108 @@ func (c *Consumer) removeConsumerFromStream(stream string) {
 	}
 }
 
+func (c *Consumer) PruneConsumers(ctx context.Context) error {
+	// find first 1000 event streams in redis
+	l := logger.FromContext(ctx)
+	sCmd := c.redis.ScanType(ctx, 0, "*.events.*", 1000, "STREAM")
+	streams, _, err := sCmd.Result()
+	if err != nil {
+		return errors.New("failed to list streams from redis")
+	}
+
+	// prune old inactive consumers
+	for _, stream := range streams {
+		ls := l.WithField("stream", stream)
+		cu := c.redis.XInfoConsumers(ctx, stream, c.options.GroupName)
+		cs, err := cu.Result()
+		if err != nil {
+			return fmt.Errorf("failed to list consumers for stream: %q group: %q", stream, c.options.GroupName)
+		}
+		for _, consumer := range cs {
+			if consumer.Name != c.options.Name && // don't remove self
+				consumer.Pending == 0 && // don't remove with pending msg
+				consumer.Idle > c.options.PruneTimeout { // respect PruneTimeout before trying to delete
+				ls.WithFields(logrus.Fields{
+					"consumer": consumer.Name,
+					"pending":  consumer.Pending,
+					"idle":     consumer.Idle,
+					"inactive": consumer.Inactive}).Infof("removing consumer from group %q", c.options.GroupName)
+				rCmd := c.redis.XGroupDelConsumer(ctx, stream, c.options.GroupName, consumer.Name)
+				pendingMsgCount, err := rCmd.Result()
+				if err != nil {
+					return fmt.Errorf("failed to remove consumer: %q for stream: %q group: %q", consumer.Name, stream, c.options.GroupName)
+				}
+				if pendingMsgCount > 0 {
+					return fmt.Errorf("remove consumer: %q with pending messages: %d for stream: %q group: %q", consumer.Name, pendingMsgCount, stream, c.options.GroupName)
+				}
+
+				// prevent ddos on redis
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+	return nil
+}
+
+func msToTime(ms string) (time.Time, error) {
+	msInt, err := strconv.ParseInt(ms, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return time.Unix(0, msInt*int64(time.Millisecond)), nil
+}
+
+func (c *Consumer) PruneMessages(ctx context.Context) error {
+	// find first 1000 event streams in redis
+	l := logger.FromContext(ctx)
+	sCmd := c.redis.ScanType(ctx, 0, "*.events.*", 1000, "STREAM")
+	streams, _, err := sCmd.Result()
+	if err != nil {
+		return errors.New("failed to list streams from redis")
+	}
+
+	// prune old inactive consumers
+	for _, stream := range streams {
+		ls := l.WithField("stream", stream)
+		cg := c.redis.XInfoGroups(ctx, stream)
+		cs, err := cg.Result()
+		if err != nil {
+			return fmt.Errorf("failed to list groups for stream: %q", stream)
+		}
+		for _, group := range cs {
+			if group.Name != c.options.GroupName {
+				continue // wrong group
+			}
+			lg := ls.WithFields(logrus.Fields{
+				"consumers":         group.Consumers,
+				"lag":               group.Lag,
+				"pending":           group.Pending,
+				"last-delivered-id": group.LastDeliveredID,
+				"group":             group.Name})
+
+			lg.Infof("checking group: %q for stream: %q for messages to prune", group.Name, stream)
+			parts := strings.Split(group.LastDeliveredID, "-")
+			ts, err := msToTime(parts[0])
+			if err != nil {
+				return stackerr.Wrap(err, "failed to parse timestamp from last delivered id %q", group.LastDeliveredID)
+			}
+
+			if ts.Before(time.Now().Add(-c.options.PruneTimeout)) {
+				rCmd := c.redis.XTrimMinID(ctx, stream, group.LastDeliveredID)
+				trimmedMsgCount, err := rCmd.Result()
+				if err != nil {
+					return fmt.Errorf("failed to trim messages for stream: %q group: %q", stream, c.options.GroupName)
+				}
+				lg.WithField("message-count", trimmedMsgCount).Infof("trimmed messages from stream: %q", stream)
+				// prevent ddos on redis
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
 // Shutdown stops new messages from being processed and tells the workers to
 // wait until all in-flight messages have been processed, and then they exit.
 // The order that things stop is 1) the reclaim process (if it's running), 2)
@@ -290,9 +375,11 @@ func (c *Consumer) Shutdown() {
 		c.stopPoll <- struct{}{}
 	}
 
-	// remove current consumer from streams
-	for stream := range c.consumers {
-		c.removeConsumerFromStream(stream)
+	if c.options.UnregisterOnShutdown {
+		// remove current consumer from streams
+		for _, stream := range c.streams {
+			c.removeConsumerFromStream(stream)
+		}
 	}
 }
 
