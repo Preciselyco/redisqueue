@@ -64,5 +64,5 @@ Session.vim
 tags
 
 cmd/cleanup/cleanup
-
+cmd/messages/messages
 # End of https://www.gitignore.io/api/go,vim,macos
