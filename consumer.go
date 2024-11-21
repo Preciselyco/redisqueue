@@ -232,7 +232,7 @@ func (c *Consumer) Run(ctx context.Context) {
 		c.streams = append(c.streams, ">")
 	}
 
-	go c.reclaim()
+	go c.reclaim(ctx)
 	go c.poll()
 
 	stop := newSignalHandler()
@@ -389,7 +389,9 @@ func (c *Consumer) Shutdown() {
 // If VisibilityTimeout is 0, this function returns early and no messages are
 // reclaimed. It checks the list of pending messages according to
 // ReclaimInterval.
-func (c *Consumer) reclaim() {
+func (c *Consumer) reclaim(ctx context.Context) {
+	l := logger.FromContext(ctx)
+
 	if c.options.VisibilityTimeout == 0 {
 		return
 	}
@@ -428,6 +430,10 @@ func (c *Consumer) reclaim() {
 
 					for _, r := range res {
 						if r.Idle >= c.options.VisibilityTimeout {
+							l.WithField("message-id", r.ID).
+								WithField("retry-count", r.RetryCount).
+								WithField("consumer", r.Consumer).Info("trying to reclaim message")
+
 							claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
 								Stream:   stream,
 								Group:    c.options.GroupName,
@@ -456,6 +462,11 @@ func (c *Consumer) reclaim() {
 								}
 							}
 							c.enqueue(stream, claimres)
+							for _, cm := range claimres {
+								l.WithField("message-id", cm.ID).
+									WithField("retry-count", r.RetryCount).
+									WithField("consumer", r.Consumer).Info("reclaiming message")
+							}
 						}
 					}
 
