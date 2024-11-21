@@ -39,7 +39,8 @@ func TestNewProducerWithOptions(t *testing.T) {
 
 	t.Run("bubbles up errors", func(tt *testing.T) {
 		_, err := NewProducerWithOptions(context.Background(), &ProducerOptions{
-			RedisOptions: &RedisOptions{Addr: "localhost:0"},
+			RedisOptions:      &RedisOptions{Addr: "localhost:0"},
+			UsePreflightCheck: true,
 		})
 		require.Error(tt, err)
 

@@ -63,7 +63,8 @@ func TestNewConsumerWithOptions(t *testing.T) {
 
 	t.Run("bubbles up errors", func(tt *testing.T) {
 		_, err := NewConsumerWithOptions(context.Background(), &ConsumerOptions{
-			RedisOptions: &RedisOptions{Addr: "localhost:0"},
+			RedisOptions:      &RedisOptions{Addr: "localhost:0"},
+			UsePreflightCheck: true,
 		})
 		require.Error(tt, err)
 
