@@ -3,11 +3,13 @@ package redisqueue
 import (
 	"context"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -184,6 +186,73 @@ func TestRun(t *testing.T) {
 
 		// run the consumer
 		c.Run(context.Background())
+	})
+
+	t.Run("calls the ConsumerFunc with error on for a message", func(tt *testing.T) {
+		// create a consumer
+		c, err := NewConsumerWithOptions(context.Background(), &ConsumerOptions{
+			VisibilityTimeout: 60 * time.Millisecond,
+			BlockingTimeout:   10 * time.Millisecond,
+			BufferSize:        100,
+			Concurrency:       10,
+		})
+		require.NoError(tt, err)
+
+		// create a producer
+		p, err := NewProducer(context.Background())
+		require.NoError(tt, err)
+
+		// create consumer group
+		c.redis.XGroupDestroy(context.Background(), tt.Name(), c.options.GroupName)
+		c.redis.XGroupCreateMkStream(context.Background(), tt.Name(), c.options.GroupName, "$")
+
+		// enqueue a message
+		err = p.Enqueue(context.Background(), &Message{
+			Stream: tt.Name(),
+			Values: map[string]interface{}{"test": "value"},
+		})
+		require.NoError(tt, err)
+
+		// register a handler that will assert the message and then shut down
+		// the consumer
+		c.Register(tt.Name(), func(m *Message) error {
+			assert.Equal(tt, "value", m.Values["test"])
+			c.Shutdown()
+			return errors.New("func error")
+		})
+
+		// watch for consumer errors
+		go func() {
+			err := <-c.Errors
+			require.Error(tt, err)
+		}()
+
+		// run the consumer
+		c.Run(context.Background())
+
+		// time.Sleep(c.options.VisibilityTimeout)
+
+		c2, err := NewConsumerWithOptions(context.Background(), &ConsumerOptions{
+			VisibilityTimeout: 60 * time.Millisecond,
+			BlockingTimeout:   10 * time.Millisecond,
+			BufferSize:        100,
+			Concurrency:       10,
+		})
+		require.NoError(tt, err)
+
+		// register a handler that will assert the message and then shut down
+		// the consumer
+		c2.Register(tt.Name(), func(m *Message) error {
+			assert.Equal(tt, "value", m.Values["test"])
+			c2.Shutdown()
+			return nil
+		})
+		// watch for consumer errors
+		go func() {
+			err := <-c2.Errors
+			require.NoError(tt, err)
+		}()
+		c2.Run(context.Background())
 	})
 
 	t.Run("reclaims pending messages according to ReclaimInterval", func(tt *testing.T) {
@@ -491,5 +560,68 @@ func TestRun(t *testing.T) {
 
 		// run the consumer
 		c.Run(context.Background())
+	})
+	t.Run("move messages to dlq after SkipReclaimAfter tries", func(tt *testing.T) {
+		// create a consumer
+		c, err := NewConsumerWithOptions(context.Background(), &ConsumerOptions{
+			VisibilityTimeout: 5 * time.Millisecond,
+			BlockingTimeout:   10 * time.Millisecond,
+			ReclaimInterval:   1 * time.Millisecond,
+			BufferSize:        100,
+			Concurrency:       2,
+			SkipReclaimAfter:  3,
+		})
+		require.NoError(tt, err)
+
+		// create a producer
+		p, err := NewProducer(context.Background())
+		require.NoError(tt, err)
+
+		// create consumer group
+		c.redis.XGroupDestroy(context.Background(), tt.Name(), c.options.GroupName)
+		c.redis.XGroupCreateMkStream(context.Background(), tt.Name(), c.options.GroupName, "$")
+
+		// enqueue a message
+		msg := &Message{
+			Stream: tt.Name(),
+			Values: map[string]interface{}{"test": "value"},
+		}
+		err = p.Enqueue(context.Background(), msg)
+		require.NoError(tt, err)
+
+		// register a handler that will assert the message and then shut down
+		// the consumer
+		var retries int64
+		c.Register(tt.Name(), func(m *Message) error {
+			assert.Equal(tt, msg.ID, m.ID)
+			atomic.AddInt64(&retries, 1)
+			return errors.New("retry error")
+		})
+
+		// watch for consumer errors
+		go func() {
+			for {
+				err := <-c.Errors
+				logrus.WithError(err).Error("error")
+			}
+		}()
+
+		go func() { // shutdown controller
+			for {
+				if retries >= int64(c.options.SkipReclaimAfter) {
+					c.Shutdown()
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+
+		// run the consumer
+		c.Run(context.Background())
+		require.Equal(tt, uint(c.options.SkipReclaimAfter+1), uint(retries))
+		// read the message but don't acknowledge it
+		res, err := c.redis.XRange(context.Background(), "dlq-"+tt.Name(), "-", "+").Result()
+		require.NoError(tt, err)
+		require.GreaterOrEqual(tt, len(res), 1)
 	})
 }
