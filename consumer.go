@@ -80,6 +80,10 @@ type ConsumerOptions struct {
 	// Automatically try to unregister consumer from streams when shutting down
 	// Default false
 	UnregisterOnShutdown bool
+	//
+	// SkipReclaimAfter
+	// Default 5
+	SkipReclaimAfter uint
 }
 
 // Consumer adds a convenient wrapper around dequeuing and managing concurrency.
@@ -112,6 +116,7 @@ var defaultConsumerOptions = &ConsumerOptions{
 	Concurrency:       10,
 	PruneTimeout:      24 * time.Hour,
 	UsePreflightCheck: true,
+	SkipReclaimAfter:  5,
 }
 
 // NewConsumer uses a default set of options to create a Consumer. It sets Name
@@ -140,6 +145,9 @@ func NewConsumerWithOptions(ctx context.Context, options *ConsumerOptions) (*Con
 	}
 	if options.ReclaimInterval == 0 {
 		options.ReclaimInterval = 1 * time.Second
+	}
+	if options.SkipReclaimAfter == 0 {
+		options.SkipReclaimAfter = 5
 	}
 
 	var r redis.UniversalClient
@@ -232,8 +240,8 @@ func (c *Consumer) Run(ctx context.Context) {
 		c.streams = append(c.streams, ">")
 	}
 
-	go c.reclaim()
-	go c.poll()
+	go c.reclaim(ctx)
+	go c.poll(ctx)
 
 	stop := newSignalHandler()
 	go func() {
@@ -244,7 +252,7 @@ func (c *Consumer) Run(ctx context.Context) {
 	c.wg.Add(c.options.Concurrency)
 
 	for i := 0; i < c.options.Concurrency; i++ {
-		go c.work()
+		go c.work(ctx)
 	}
 
 	// blocking, waiting for shutdown
@@ -389,7 +397,9 @@ func (c *Consumer) Shutdown() {
 // If VisibilityTimeout is 0, this function returns early and no messages are
 // reclaimed. It checks the list of pending messages according to
 // ReclaimInterval.
-func (c *Consumer) reclaim() {
+func (c *Consumer) reclaim(ctx context.Context) {
+	l := logger.FromContext(ctx)
+
 	if c.options.VisibilityTimeout == 0 {
 		return
 	}
@@ -428,6 +438,13 @@ func (c *Consumer) reclaim() {
 
 					for _, r := range res {
 						if r.Idle >= c.options.VisibilityTimeout {
+							lr := l.WithField("message-id", r.ID).
+								WithField("retry-count", r.RetryCount).
+								WithField("consumer", r.Consumer).
+								WithField("stream", stream)
+
+							lr.Info("trying to reclaim message")
+
 							claimres, err := c.redis.XClaim(context.Background(), &redis.XClaimArgs{
 								Stream:   stream,
 								Group:    c.options.GroupName,
@@ -455,7 +472,18 @@ func (c *Consumer) reclaim() {
 									continue
 								}
 							}
-							c.enqueue(stream, claimres)
+
+							for _, cm := range claimres {
+								if r.RetryCount > int64(c.options.SkipReclaimAfter) {
+									lr.Warn("moving message to dead letter queue")
+									err = c.dlq(context.Background(), stream, cm)
+									if err != nil {
+										c.Errors <- errors.Wrapf(err, "error moving message to dlq for %q stream and %q message", stream, r.ID)
+									}
+									continue
+								}
+								c.requeue(stream, cm, uint(r.RetryCount))
+							}
 						}
 					}
 
@@ -472,17 +500,40 @@ func (c *Consumer) reclaim() {
 	}
 }
 
+// dlq add message to dead letter queue
+func (c *Consumer) dlq(ctx context.Context, stream string, msg redis.XMessage) error {
+	args := &redis.XAddArgs{
+		ID:     msg.ID,
+		Stream: "dlq-" + stream,
+		Values: msg.Values,
+	}
+	_, err := c.redis.XAdd(ctx, args).Result()
+	if err != nil {
+		return err
+	}
+	err = c.redis.XAck(context.Background(), stream, c.options.GroupName, msg.ID).Err()
+	if err != nil {
+		return err
+	}
+	err = c.redis.XDel(context.Background(), stream, msg.ID).Err()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // poll constantly checks the streams using XREADGROUP to see if there are any
 // messages for this consumer to process. It blocks for up to 5 seconds instead
 // of blocking indefinitely so that it can periodically check to see if Shutdown
 // was called.
-func (c *Consumer) poll() {
+func (c *Consumer) poll(ctx context.Context) {
 	for {
 		select {
 		case <-c.stopPoll:
 			// once the polling has stopped (i.e. there will be no more messages
 			// put onto c.queue), stop all of the workers
 			for i := 0; i < c.options.Concurrency; i++ {
+				logger.FromContext(ctx).Debugf("stopping worker: %d", i)
 				c.stopWorkers <- struct{}{}
 			}
 			return
@@ -525,27 +576,42 @@ func (c *Consumer) enqueue(stream string, msgs []redis.XMessage) {
 	}
 }
 
+// requeue takes a XMessage, creates corresponding Message, and sends
+// them on the centralized channel for worker goroutines to process.
+func (c *Consumer) requeue(stream string, xmsg redis.XMessage, retryCount uint) {
+	msg := &Message{
+		ID:         xmsg.ID,
+		Stream:     stream,
+		Values:     xmsg.Values,
+		RetryCount: retryCount,
+	}
+	c.queue <- msg
+}
+
 // work is called in a separate goroutine. The number of work goroutines is
 // determined by Concurreny. Once it gets a message from the centralized
 // channel, it calls the corrensponding ConsumerFunc depending on the stream it
 // came from. If no error is returned from the ConsumerFunc, the message is
 // acknowledged in Redis.
-func (c *Consumer) work() {
+func (c *Consumer) work(ctx context.Context) {
 	defer c.wg.Done()
-
+	l := logger.FromContext(ctx)
 	for {
 		select {
 		case msg := <-c.queue:
+			lm := l.WithField("message-id", msg.ID).WithField("stream", msg.Stream)
 			err := c.process(msg)
 			if err != nil {
 				c.Errors <- errors.Wrapf(err, "error calling ConsumerFunc for %q stream and %q message", msg.Stream, msg.ID)
 				continue
 			}
+			lm.Debug("processed message successfully")
 			err = c.redis.XAck(context.Background(), msg.Stream, c.options.GroupName, msg.ID).Err()
 			if err != nil {
 				c.Errors <- errors.Wrapf(err, "error acknowledging after success for %q stream and %q message", msg.Stream, msg.ID)
 				continue
 			}
+			lm.Debug("acknowledged message")
 		case <-c.stopWorkers:
 			return
 		}
