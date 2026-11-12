@@ -16,6 +16,9 @@
   "postUpdateOptions": [
     "gomodTidy"
   ],
+  "env": {
+    "GOPRIVATE": "github.com/Preciselyco/*"
+  },
   "vulnerabilityAlerts": {
     "labels": [
       "security"
@@ -53,7 +56,7 @@
       ]
     },
     {
-      "description": "Renovate cannot resolve our private Go modules, so their bumps write a bare hash into go.mod and fail every check until someone finishes them by hand (go get <module>@<hash>). Keeping them in their own weekly PR stops them turning the non-major group red.",
+      "description": "Our own Go modules move in their own weekly PR, so a problem with one of them doesn't hold up the non-major group.",
       "groupName": "Preciselyco Go modules",
       "groupSlug": "preciselyco-go-modules",
       "matchManagers": [
