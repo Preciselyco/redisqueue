@@ -1,7 +1,82 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "A copy of github>Preciselyco/renovate-config (default.json). This repository is public and that preset is private, and Renovate does not load private presets into public repositories. Keep it in step with the preset."
+  ],
   "extends": [
-    "github>Preciselyco/renovate-config"
+    "config:recommended",
+    "group:recommended",
+    "schedule:weekly",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "assigneesFromCodeOwners": true,
+  "assigneesSampleSize": 1,
+  "updateNotScheduled": false,
+  "rebaseWhen": "conflicted",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "vulnerabilityAlerts": {
+    "labels": [
+      "security"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "Actions are pinned to a digest, so show which version a bump moves to.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "commitMessageTopic": "{{depName}}",
+      "commitMessageExtra": "to {{newVersion}}"
+    },
+    {
+      "description": "Our own reusable workflows and actions stay on a branch ref. Pinning them to a digest would mean a fix in buildpipeline needed a Renovate PR merged in every consumer before it took effect, which is the opposite of what shared workflows are for. Pinning guards against code we do not control; this is code we do.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "/^[Pp]reciselyco\\//"
+      ],
+      "pinDigests": false
+    },
+    {
+      "description": "Every push to a Renovate branch runs the repository's full PR pipeline. One weekly PR for every non-major bump, across all managers, keeps that to one run per week instead of one per package per upstream release. Repositories can still split packages out with their own groups. Security fixes are not affected: vulnerabilityAlerts ignore groups and schedules.",
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ]
+    },
+    {
+      "description": "Renovate cannot resolve our private Go modules, so their bumps write a bare hash into go.mod and fail every check until someone finishes them by hand (go get <module>@<hash>). Keeping them in their own weekly PR stops them turning the non-major group red.",
+      "groupName": "Preciselyco Go modules",
+      "groupSlug": "preciselyco-go-modules",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "/^github\\.com\\/[Pp]reciselyco\\//"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ]
+    },
+    {
+      "description": "Majors are migrations, not routine updates: open them once a month.",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "schedule": [
+        "on the first day of the month"
+      ]
+    }
   ],
   "hostRules": [
     {
